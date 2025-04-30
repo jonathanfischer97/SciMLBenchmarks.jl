@@ -13,7 +13,7 @@ We'll use the following packages:
 
 ```julia
 using BlackBoxOptimizationBenchmarking, Optimization
-using OptimizationBBO, OptimizationOptimJL, OptimizationNLopt, OptimizationMetaheuristics #todo: I think we should remove the OptimizationMetaheuristics dependency, as that wasn't included originally in the "SciMLBenchmarks.jl/benchmarks/OptimizationFrameworks/Project.toml" file, and we're only concerned with BlackBoxOptim, not Metaheuristics.
+using OptimizationBBO, OptimizationOptimJL, OptimizationNLopt
 using Plots, LinearAlgebra, Random, BenchmarkTools
 
 # For reproducibility
@@ -88,20 +88,9 @@ nlopt_names = [
     "NLopt: ESCH"
 ]
 
-# Metaheuristics optimizers
-metaheuristics_optimizers = [
-    OptimizationMetaheuristics.ECA(),
-    OptimizationMetaheuristics.DE()
-]
-
-metaheuristics_names = [
-    "Metaheuristics: ECA",
-    "Metaheuristics: DE"
-]
-
 # Combine all optimizers and names
-all_optimizers = vcat(bbo_optimizers, optimjl_optimizers, nlopt_optimizers, metaheuristics_optimizers)
-all_names = vcat(bbo_names, optimjl_names, nlopt_names, metaheuristics_names)
+all_optimizers = vcat(bbo_optimizers, optimjl_optimizers, nlopt_optimizers)
+all_names = vcat(bbo_names, optimjl_names, nlopt_names)
 ```
 
 ## Benchmarking Functions
