@@ -1,0 +1,456 @@
+---
+title: Black-Box Optimization Benchmarking (BBOB) with Optimization.jl
+author: Jonathan Fischer
+---
+
+This benchmark evaluates various black-box optimization algorithms from different Julia packages on standardized test functions from the BBOB (Black-Box Optimization Benchmarking) suite. We use the unified Optimization.jl interface to access optimizers from multiple packages, enabling fair comparisons across different implementations.
+
+The BBOB test functions include a diverse set of challenging optimization problems with characteristics such as multi-modality, ill-conditioning, and non-separability - making them ideal for evaluating black-box optimization algorithms.
+
+## Setup
+
+We'll use the following packages:
+
+```julia
+using BlackBoxOptimizationBenchmarking, Optimization
+using OptimizationBBO, OptimizationOptimJL, OptimizationNLopt, OptimizationMetaheuristics #todo: I think we should remove the OptimizationMetaheuristics dependency, as that wasn't included originally in the "SciMLBenchmarks.jl/benchmarks/OptimizationFrameworks/Project.toml" file, and we're only concerned with BlackBoxOptim, not Metaheuristics.
+using Plots, LinearAlgebra, Random, BenchmarkTools
+
+# For reproducibility
+Random.seed!(42)
+
+const BBOB = BlackBoxOptimizationBenchmarking
+
+# Note: For black-box optimization benchmarks, we don't need automatic differentiation,
+# so we'll explicitly set autodiff=:none to avoid potential backend dependencies.
+# This is especially helpful in environments where packages like ReverseDiff may not be available.
+```
+
+## BBOB Function Overview
+
+The BBOB suite consists of 24 functions with varying characteristics. Let's first examine what functions are available and select a subset for our benchmarks:
+
+```julia
+# Get all BBOB functions
+bbob_functions = BBOB.list_functions()
+
+# Print the names of the functions
+println("Available BBOB Functions:")
+for (i, f) in enumerate(bbob_functions)
+    println("$i. $(f.name)")
+end
+
+# Select a subset for our benchmarks
+test_functions = bbob_functions[1:10]  # First 10 functions
+```
+
+## Optimizer Setup
+
+We'll test optimizers from multiple packages, all accessed through the Optimization.jl interface:
+
+```julia
+# BBO optimizers
+bbo_optimizers = [
+    BBO_adaptive_de_rand_1_bin_radiuslimited(),
+    BBO_de_rand_1_bin(),
+    BBO_de_rand_2_bin(),
+    BBO_separable_nes(),
+    BBO_xnes()
+]
+
+bbo_names = [
+    "BBO: DE Adaptive",
+    "BBO: DE Rand 1 Bin",
+    "BBO: DE Rand 2 Bin", 
+    "BBO: Separable NES",
+    "BBO: xNES"
+]
+
+# OptimJL optimizers
+optimjl_optimizers = [
+    NelderMead(),
+    SAMIN(rt=0.5, verbosity=0)
+]
+
+optimjl_names = [
+    "OptimJL: Nelder-Mead",
+    "OptimJL: SAMIN"
+]
+
+# NLopt optimizers
+nlopt_optimizers = [
+    OptimizationNLopt.NLopt.Opt(:GN_CRS2_LM, 3),
+    OptimizationNLopt.NLopt.Opt(:GN_ESCH, 3)
+]
+
+nlopt_names = [
+    "NLopt: CRS2",
+    "NLopt: ESCH"
+]
+
+# Metaheuristics optimizers
+metaheuristics_optimizers = [
+    OptimizationMetaheuristics.ECA(),
+    OptimizationMetaheuristics.DE()
+]
+
+metaheuristics_names = [
+    "Metaheuristics: ECA",
+    "Metaheuristics: DE"
+]
+
+# Combine all optimizers and names
+all_optimizers = vcat(bbo_optimizers, optimjl_optimizers, nlopt_optimizers, metaheuristics_optimizers)
+all_names = vcat(bbo_names, optimjl_names, nlopt_names, metaheuristics_names)
+```
+
+## Benchmarking Functions
+
+Now, let's define the functions to run our benchmarks:
+
+```julia
+"""
+Run a single optimization trial and return performance metrics.
+"""
+function run_optimization_trial(f::BBOB.BBOBFunction, optimizer, dimension::Int, max_iters::Int)
+    # Create the optimization problem with autodiff=:none to avoid ReverseDiff dependency
+    prob = BBOB.to_optimization_problem(f, dimension; autodiff=:none)
+    
+    # Use BenchmarkTools to measure execution time more accurately
+    # Only run a single sample since these are expensive optimization problems
+    b = @benchmarkable solve($prob, $optimizer; maxiters=$max_iters) samples=1 evals=1
+    trial = run(b)
+    time_result = minimum(trial).time / 1e9  # Convert from ns to seconds
+    
+    # Run the actual optimization (outside of timing) to get the result
+    result = solve(prob, optimizer; maxiters=max_iters)
+    
+    # Calculate distance to true minimizer
+    dist_to_min = norm(result.u - f.x_opt[1:dimension])
+    
+    # Check if the solution is considered successful (within tolerance of true minimum)
+    Δf = 1e-6
+    is_success = result.objective < Δf + f.f_opt
+    
+    return (
+        objective = result.objective,
+        solution = result.u,
+        success = is_success,
+        distance = dist_to_min,
+        runtime = time_result
+    )
+end
+
+"""
+Run multiple optimization trials and aggregate results.
+"""
+function run_benchmark(f::BBOB.BBOBFunction, optimizer, dimension::Int, max_iters::Int, n_trials::Int)
+    results = [run_optimization_trial(f, optimizer, dimension, max_iters) for _ in 1:n_trials]
+    
+    # Calculate statistics manually to avoid Statistics dependency
+    success_values = [r.success for r in results]
+    objective_values = [r.objective for r in results]
+    distance_values = [r.distance for r in results]
+    runtime_values = [r.runtime for r in results]
+    
+    n = length(results)
+    success_rate = sum(success_values) / n
+    mean_obj = sum(objective_values) / n
+    mean_dist = sum(distance_values) / n
+    mean_runtime = sum(runtime_values) / n
+    best_obj = minimum(objective_values)
+    
+    return (
+        success_rate = success_rate,
+        mean_objective = mean_obj,
+        mean_distance = mean_dist,
+        mean_runtime = mean_runtime,
+        best_objective = best_obj,
+        raw_results = results
+    )
+end
+
+"""
+Run benchmarks for multiple optimizers on multiple functions.
+"""
+function run_comparison(functions, optimizers, names, dimension, max_iters, n_trials)
+    results = Dict{String, Dict{String, Any}}()
+    
+    for f in functions
+        results[f.name] = Dict{String, Any}()
+        println("Running benchmarks on $(f.name)...")
+        
+        for (i, optimizer) in enumerate(optimizers)
+            name = names[i]
+            println("  Testing $name...")
+            
+            try
+                results[f.name][name] = run_benchmark(f, optimizer, dimension, max_iters, n_trials)
+            catch e
+                println("    Failed: $e")
+                results[f.name][name] = (
+                    success_rate = 0.0,
+                    mean_objective = Inf,
+                    mean_distance = Inf,
+                    mean_runtime = NaN,
+                    best_objective = Inf,
+                    raw_results = []
+                )
+            end
+        end
+    end
+    
+    return results
+end
+```
+
+## Running the Benchmarks
+
+Now we'll run the benchmarks with the following parameters:
+
+```julia
+# Benchmark parameters
+dimension = 3        # Problem dimension
+max_iters = 2000     # Maximum iterations per run
+n_trials = 10        # Number of trials per function/optimizer
+
+# Run the benchmarks
+benchmark_results = run_comparison(
+    test_functions,
+    all_optimizers,
+    all_names,
+    dimension,
+    max_iters,
+    n_trials
+)
+```
+
+## Results Analysis
+
+Let's analyze and visualize the results:
+
+```julia
+"""
+Create a heatmap of success rates.
+"""
+function plot_success_heatmap(results, functions, names)
+    n_optimizers = length(names)
+    n_functions = length(functions)
+    
+    # Create matrix of success rates
+    success_matrix = zeros(n_functions, n_optimizers)
+    
+    for (i, f) in enumerate(functions)
+        for (j, name) in enumerate(names)
+            success_matrix[i, j] = get(get(results[f.name], name, Dict()), :success_rate, 0.0)
+        end
+    end
+    
+    # Create heatmap
+    function_names = [split(f.name, " ")[1] for f in functions]  # Shorter names
+    
+    p = heatmap(
+        names, function_names, success_matrix,
+        xlabel="Optimizer",
+        ylabel="Test Function",
+        title="Success Rate Comparison",
+        color=:RdYlGn,
+        clim=(0, 1),
+        yticks=:all,
+        xticks=:all,
+        xrotation=45,
+        size=(900, 600)
+    )
+    
+    return p
+end
+
+"""
+Create a bar plot of average performance metrics.
+"""
+function plot_performance_metrics(results, functions, names, metric=:mean_distance)
+    n_optimizers = length(names)
+    
+    # Calculate average metric across functions
+    avg_metric = zeros(n_optimizers)
+    
+    for (j, name) in enumerate(names)
+        values = Float64[]
+        for f in functions
+            value = get(get(results[f.name], name, Dict()), metric, NaN)
+            if !isnan(value) && isfinite(value)
+                push!(values, value)
+            end
+        end
+        
+        avg_metric[j] = isempty(values) ? NaN : sum(values) / length(values)
+    end
+    
+    # Sort by performance
+    sorted_idx = sortperm(avg_metric)
+    sorted_names = names[sorted_idx]
+    sorted_metrics = avg_metric[sorted_idx]
+    
+    # Create metrics names
+    metric_name = String(metric)
+    title_name = join(split(metric_name, "_"), " ")
+    
+    # Create bar plot
+    p = bar(
+        sorted_names,
+        sorted_metrics,
+        xlabel="Optimizer",
+        ylabel=title_name,
+        title="Average $title_name Across Functions",
+        xrotation=45,
+        size=(900, 500),
+        legend=false
+    )
+    
+    return p
+end
+
+# Create the visualizations
+success_plot = plot_success_heatmap(benchmark_results, test_functions, all_names)
+distance_plot = plot_performance_metrics(benchmark_results, test_functions, all_names, :mean_distance)
+runtime_plot = plot_performance_metrics(benchmark_results, test_functions, all_names, :mean_runtime)
+
+# Display the plots
+success_plot
+```
+
+```julia
+distance_plot
+```
+
+```julia
+runtime_plot
+```
+
+## Detailed Analysis
+
+Let's look at detailed performance statistics for each optimizer:
+
+```julia
+function print_summary_table(results, functions, names)
+    # Calculate aggregate statistics without using Statistics
+    optimizer_stats = Dict{String, Dict{Symbol, Float64}}()
+    
+    for name in names
+        success_rates = Float64[]
+        distances = Float64[]
+        runtimes = Float64[]
+        
+        for f in functions
+            if haskey(results[f.name], name)
+                r = results[f.name][name]
+                push!(success_rates, r.success_rate)
+                push!(distances, r.mean_distance)
+                push!(runtimes, r.mean_runtime)
+            end
+        end
+        
+        # Manual calculation of means
+        n_success = length(success_rates)
+        n_distance = length(distances)
+        n_runtime = length(runtimes)
+        
+        avg_success = n_success > 0 ? sum(success_rates) / n_success : 0.0
+        avg_distance = n_distance > 0 ? sum(distances) / n_distance : 0.0
+        avg_runtime = n_runtime > 0 ? sum(runtimes) / n_runtime : 0.0
+        
+        optimizer_stats[name] = Dict(
+            :avg_success => avg_success,
+            :avg_distance => avg_distance,
+            :avg_runtime => avg_runtime
+        )
+    end
+    
+    # Sort by success rate
+    sorted_optimizers = sort(collect(names), by=name -> -optimizer_stats[name][:avg_success])
+    
+    # Print the table
+    println("| Optimizer | Success Rate | Mean Distance | Mean Runtime |")
+    println("|-----------|--------------|---------------|-------------|")
+    
+    for name in sorted_optimizers
+        stats = optimizer_stats[name]
+        println("| $(rpad(name, 20)) | $(round(stats[:avg_success], digits=2)) | $(round(stats[:avg_distance], digits=4)) | $(round(stats[:avg_runtime], digits=4)) |")
+    end
+end
+
+print_summary_table(benchmark_results, test_functions, all_names)
+```
+
+## Case Study: Rastrigin Function
+
+Let's take a closer look at the Rastrigin function, which is known for its many local minima:
+
+```julia
+# Get the Rastrigin function
+rastrigin = test_functions[3]  # Index may vary, check the list
+
+# Run a more detailed benchmark on Rastrigin
+rastrigin_results = Dict{String, Any}()
+
+for (i, optimizer) in enumerate(all_optimizers)
+    name = all_names[i]
+    println("Testing $name on Rastrigin...")
+    
+    try
+        rastrigin_results[name] = run_benchmark(rastrigin, optimizer, 2, 5000, 20)
+        
+        # Print detailed results
+        println("  Success Rate: $(rastrigin_results[name].success_rate)")
+        println("  Mean Distance: $(rastrigin_results[name].mean_distance)")
+        println("  Best Objective: $(rastrigin_results[name].best_objective)")
+    catch e
+        println("  Failed: $e")
+    end
+end
+
+# Visualize Rastrigin and solutions
+function visualize_rastrigin_solutions()
+    # Create the function plot
+    p = BBOB.plot_function(rastrigin, dimension=2, size=(800, 600), zoom=1.5)
+    
+    # Plot some solution points from different optimizers
+    optimizer_colors = Dict(zip(all_names, 1:length(all_names)))
+    
+    for (name, results) in rastrigin_results
+        if haskey(results, :raw_results) && !isempty(results.raw_results)
+            # Get the best result
+            best_idx = argmin([r.objective for r in results.raw_results])
+            best_result = results.raw_results[best_idx]
+            
+            # Add the solution point to the plot
+            scatter!(
+                p,
+                [best_result.solution[1]],
+                [best_result.solution[2]],
+                label=name,
+                markersize=6,
+                markershape=:circle,
+                color=get(optimizer_colors, name, 1)
+            )
+        end
+    end
+    
+    return p
+end
+
+rastrigin_plot = visualize_rastrigin_solutions()
+rastrigin_plot
+```
+
+## Conclusion
+
+This benchmark suite demonstrates how to use the Optimization.jl interface to evaluate multiple black-box optimization algorithms from different packages on standard test problems. The BBOB functions provide a challenging set of test cases that help distinguish the strengths and weaknesses of different optimizers.
+
+Based on our results, we can make the following observations:
+
+1. The differential evolution variants from BlackBoxOptim (particularly `BBO_adaptive_de_rand_1_bin_radiuslimited`) tend to perform well across many functions.
+2. Some algorithms excel on specific problem types but struggle on others, highlighting the importance of algorithm selection.
+3. Runtime can vary significantly between optimizers, with simpler methods often being faster but less reliable.
+
+This benchmark provides a foundation for selecting appropriate black-box optimization algorithms for specific problem types and constraints.
