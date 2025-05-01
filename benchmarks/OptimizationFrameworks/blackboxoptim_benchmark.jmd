@@ -400,8 +400,8 @@ end
 
 # Visualize Rastrigin and solutions
 function visualize_rastrigin_solutions()
-    # Create the function plot
-    p = BBOB.plot_function(rastrigin, dimension=2, size=(800, 600), zoom=1.5)
+    # Create the function plot using recipe defined in BlackBoxOptimizationBenchmarking
+    p = plot(rastrigin, size=(800, 600), zoom=1.5)
     
     # Plot some solution points from different optimizers
     optimizer_colors = Dict(zip(all_names, 1:length(all_names)))
