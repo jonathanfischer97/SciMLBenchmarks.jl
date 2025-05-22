@@ -12,13 +12,22 @@ The BBOB test functions include a diverse set of challenging optimization proble
 We'll use the following packages:
 
 ```julia
-using BlackBoxOptimizationBenchmarking, Optimization
-using OptimizationBBO, OptimizationOptimJL, OptimizationNLopt
-using Plots, LinearAlgebra, Random, BenchmarkTools
+# Load basic utility packages first
+using LinearAlgebra, Random, BenchmarkTools
 
-# For reproducibility
-Random.seed!(42)
+# Load BlackBoxOptimizationBenchmarking and Optimization packages
+using BlackBoxOptimizationBenchmarking
+using Optimization
 
+# Load optimizer packages
+using OptimizationBBO
+using OptimizationOptimJL 
+using OptimizationNLopt
+
+# Define global RNG for reproducibility (instead of setting global seed)
+const rng = Random.MersenneTwister(42)
+
+# Create BBOB alias for convenience
 const BBOB = BlackBoxOptimizationBenchmarking
 
 # Note: For black-box optimization benchmarks, we don't need automatic differentiation,
@@ -77,10 +86,10 @@ optimjl_names = [
     "OptimJL: SAMIN"
 ]
 
-# NLopt optimizers
+# NLopt optimizers (using Algorithm enums)
 nlopt_optimizers = [
-    OptimizationNLopt.NLopt.Opt(:GN_CRS2_LM, 3),
-    OptimizationNLopt.NLopt.Opt(:GN_ESCH, 3)
+    NLopt.GN_CRS2_LM, # Pass the Algorithm enum directly
+    NLopt.GN_ESCH     # Pass the Algorithm enum directly
 ]
 
 nlopt_names = [
@@ -100,54 +109,95 @@ Now, let's define the functions to run our benchmarks:
 ```julia
 """
 Run a single optimization trial and return performance metrics.
+Accepts an `autodiff` setting for problem creation.
 """
-function run_optimization_trial(f::BBOB.BBOBFunction, optimizer, dimension::Int, max_iters::Int)
-    # Create the optimization problem with autodiff=:none to avoid ReverseDiff dependency
-    prob = BBOB.to_optimization_problem(f, dimension; autodiff=:none)
+function run_optimization_trial(f::BBOB.BBOBFunction, optimizer, dimension::Int, max_iters::Int, rng::Random.AbstractRNG; autodiff=:none, maxtime=30.0)
+    # Parameter validation
+    dimension <= 0 && throw(ArgumentError("dimension must be positive"))
+    max_iters <= 0 && throw(ArgumentError("max_iters must be positive"))
+    maxtime <= 0 && throw(ArgumentError("maxtime must be positive"))
     
-    # Use BenchmarkTools to measure execution time more accurately
-    # Only run a single sample since these are expensive optimization problems
-    b = @benchmarkable solve($prob, $optimizer; maxiters=$max_iters) samples=1 evals=1
-    trial = run(b)
-    time_result = minimum(trial).time / 1e9  # Convert from ns to seconds
+    Δf = 1e-6  # Success threshold from BBOB specifications
     
-    # Run the actual optimization (outside of timing) to get the result
-    result = solve(prob, optimizer; maxiters=max_iters)
+    x0 = 10 * rand(rng, dimension) .- 5
+    prob = BBOB.to_optimization_problem(f, dimension; autodiff=autodiff, x0=x0)
     
-    # Calculate distance to true minimizer
-    dist_to_min = norm(result.u - f.x_opt[1:dimension])
+    timed_result = @btimed solve($prob, $optimizer; maxiters=$max_iters, maxtime=$maxtime)
     
-    # Check if the solution is considered successful (within tolerance of true minimum)
-    Δf = 1e-6
+    result = timed_result.value
+    time_trial = timed_result.time
+    
+    if isnothing(result) || !hasproperty(result, :u) || !hasproperty(result, :objective)
+        @warn "Invalid optimization result" optimizer=typeof(optimizer) function_name=f.name
+        return (
+            objective = Inf,
+            solution = fill(NaN, dimension),
+            success = false,
+            distance = Inf,
+            runtime = time_trial,
+            error = true,
+            nfe = NaN
+        )
+    end
+
+    dist_to_min = if length(f.x_opt) >= dimension
+        norm(result.u - f.x_opt[1:dimension])
+    else
+        @warn "Insufficient optimal points" function_name=f.name dimension=dimension available=length(f.x_opt)
+        Inf
+    end
+
     is_success = result.objective < Δf + f.f_opt
+    nfe = hasproperty(result, :stats) && hasproperty(result.stats, :nf) ? result.stats.nf : NaN
     
     return (
         objective = result.objective,
         solution = result.u,
         success = is_success,
         distance = dist_to_min,
-        runtime = time_result
+        runtime = time_trial,
+        error = false,
+        nfe = nfe
     )
 end
 
 """
 Run multiple optimization trials and aggregate results.
+Accepts an `autodiff` setting to pass down.
 """
-function run_benchmark(f::BBOB.BBOBFunction, optimizer, dimension::Int, max_iters::Int, n_trials::Int)
-    results = [run_optimization_trial(f, optimizer, dimension, max_iters) for _ in 1:n_trials]
+function run_benchmark(f::BBOB.BBOBFunction, optimizer, dimension::Int, max_iters::Int, n_trials::Int; autodiff=:none, maxtime=30.0)
+    results = [run_optimization_trial(f, optimizer, dimension, max_iters, rng; autodiff=autodiff, maxtime=maxtime) for _ in 1:n_trials]
     
-    # Calculate statistics manually to avoid Statistics dependency
-    success_values = [r.success for r in results]
-    objective_values = [r.objective for r in results]
-    distance_values = [r.distance for r in results]
-    runtime_values = [r.runtime for r in results]
-    
-    n = length(results)
-    success_rate = sum(success_values) / n
-    mean_obj = sum(objective_values) / n
-    mean_dist = sum(distance_values) / n
-    mean_runtime = sum(runtime_values) / n
+    valid_results = filter(r -> !r.error, results)
+    n_valid = length(valid_results)
+
+    if n_valid == 0
+        println("    Warning: All trials failed or yielded invalid results.")
+        return (
+            success_rate = 0.0,
+            mean_objective = Inf,
+            mean_distance = Inf,
+            mean_runtime = NaN,
+            best_objective = Inf,
+            raw_results = results
+        )
+    end
+
+    success_values = [r.success for r in valid_results]
+    objective_values = [r.objective for r in valid_results]
+    distance_values = [r.distance for r in valid_results]
+    runtime_values = [r.runtime for r in valid_results]
+
+    success_rate = sum(success_values) / n_trials 
+    mean_obj = sum(objective_values) / n_valid
+    finite_distances = filter(isfinite, distance_values)
+    mean_dist = isempty(finite_distances) ? Inf : sum(finite_distances) / length(finite_distances)
+    finite_runtimes = filter(!isnan, runtime_values)
+    mean_runtime = isempty(finite_runtimes) ? NaN : sum(finite_runtimes) / length(finite_runtimes)
     best_obj = minimum(objective_values)
+    
+    nfe_values = [r.nfe for r in valid_results if !isnan(r.nfe)]
+    mean_nfe = isempty(nfe_values) ? NaN : sum(nfe_values) / length(nfe_values)
     
     return (
         success_rate = success_rate,
@@ -155,28 +205,39 @@ function run_benchmark(f::BBOB.BBOBFunction, optimizer, dimension::Int, max_iter
         mean_distance = mean_dist,
         mean_runtime = mean_runtime,
         best_objective = best_obj,
-        raw_results = results
+        raw_results = results,
+        mean_nfe = mean_nfe
     )
 end
 
 """
 Run benchmarks for multiple optimizers on multiple functions.
+Determines appropriate autodiff setting based on optimizer.
 """
-function run_comparison(functions, optimizers, names, dimension, max_iters, n_trials)
+function run_comparison(functions, optimizers, names, dimension, max_iters, n_trials, maxtime=30.0)
     results = Dict{String, Dict{String, Any}}()
     
-    for f in functions
+    total_combinations = length(functions) * length(optimizers)
+    println("Starting benchmark comparisons for $total_combinations function/optimizer pairs...")
+    
+    for f_idx in eachindex(functions)
+        f = functions[f_idx]
         results[f.name] = Dict{String, Any}()
-        println("Running benchmarks on $(f.name)...")
         
         for (i, optimizer) in enumerate(optimizers)
             name = names[i]
-            println("  Testing $name...")
             
+            current_autodiff = any(T -> typeof(optimizer) <: T, [NelderMead]) ? 
+                Optimization.AutoForwardDiff() : :none
+                
+            @info "Testing optimizer" function_name=f.name optimizer_name=name autodiff_setting=current_autodiff
+            
+            time_start = time()
             try
-                results[f.name][name] = run_benchmark(f, optimizer, dimension, max_iters, n_trials)
+                results[f.name][name] = run_benchmark(f, optimizer, dimension, max_iters, n_trials; 
+                    autodiff=current_autodiff, maxtime=maxtime)
             catch e
-                println("    Failed: $e")
+                @error "Benchmark failed for $(f.name) with $name" error_details=e
                 results[f.name][name] = (
                     success_rate = 0.0,
                     mean_objective = Inf,
@@ -186,6 +247,8 @@ function run_comparison(functions, optimizers, names, dimension, max_iters, n_tr
                     raw_results = []
                 )
             end
+            time_end = time()
+            println("    Finished $(f.name) with $name in $(round(time_end - time_start, digits=2)) seconds.")
         end
     end
     
@@ -199,9 +262,10 @@ Now we'll run the benchmarks with the following parameters:
 
 ```julia
 # Benchmark parameters
-dimension = 3        # Problem dimension
-max_iters = 2000     # Maximum iterations per run
-n_trials = 10        # Number of trials per function/optimizer
+dimension = 5        # Standard BBOB test dimension
+max_iters = 5000    # Increased budget for better convergence
+n_trials = 1       # For statistical significance
+maxtime = 30.0      # Maximum time per trial in seconds
 
 # Run the benchmarks
 benchmark_results = run_comparison(
@@ -210,7 +274,8 @@ benchmark_results = run_comparison(
     all_names,
     dimension,
     max_iters,
-    n_trials
+    n_trials,
+    maxtime
 )
 ```
 
@@ -219,101 +284,48 @@ benchmark_results = run_comparison(
 Let's analyze and visualize the results:
 
 ```julia
-"""
-Create a heatmap of success rates.
-"""
+# Load plotting package in this block
+using Plots
+# Make sure we have the right backend configuration
+gr(size=(800, 600), dpi=300, fmt=:png)
+
+# Visualize success heatmap
 function plot_success_heatmap(results, functions, names)
-    n_optimizers = length(names)
-    n_functions = length(functions)
-    
-    # Create matrix of success rates
-    success_matrix = zeros(n_functions, n_optimizers)
-    
-    for (i, f) in enumerate(functions)
-        for (j, name) in enumerate(names)
-            success_matrix[i, j] = get(get(results[f.name], name, Dict()), :success_rate, 0.0)
-        end
-    end
-    
-    # Create heatmap
-    function_names = [split(f.name, " ")[1] for f in functions]  # Shorter names
-    
-    p = heatmap(
-        names, function_names, success_matrix,
-        xlabel="Optimizer",
-        ylabel="Test Function",
-        title="Success Rate Comparison",
-        color=:RdYlGn,
-        clim=(0, 1),
-        yticks=:all,
-        xticks=:all,
-        xrotation=45,
-        size=(900, 600)
-    )
-    
-    return p
+    # Create a heatmap of success rates
+    success_rates = [results[f.name][name].success_rate for f in functions for name in names]
+    heatmap(success_rates, aspect_ratio=:equal, c=:viridis, xlabel="Function", ylabel="Optimizer", title="Success Rate Heatmap")
 end
 
-"""
-Create a bar plot of average performance metrics.
-"""
-function plot_performance_metrics(results, functions, names, metric=:mean_distance)
-    n_optimizers = length(names)
-    
-    # Calculate average metric across functions
-    avg_metric = zeros(n_optimizers)
-    
-    for (j, name) in enumerate(names)
-        values = Float64[]
-        for f in functions
-            value = get(get(results[f.name], name, Dict()), metric, NaN)
-            if !isnan(value) && isfinite(value)
-                push!(values, value)
-            end
-        end
+# Visualize performance metrics
+function plot_performance_metrics(results, functions, names)
+    # Create separate plots for each performance metric
+    metrics = [:mean_objective, :mean_distance, :mean_runtime]
+    metric_labels = ["Mean Objective", "Mean Distance to Optimum", "Mean Runtime (s)"]
+
+    for (idx, metric) in enumerate(metrics)
+        metric_data = [results[f.name][name][metric] for f in functions, name in names]
         
-        avg_metric[j] = isempty(values) ? NaN : sum(values) / length(values)
+        p = heatmap(metric_data, 
+                    xticks=(1:length(names), names),
+                    yticks=(1:length(functions), [f.name for f in functions]),
+                    xlabel="Optimizer", 
+                    ylabel="BBOB Function", 
+                    title="Performance: $(metric_labels[idx])",
+                    xrotation=45,
+                    yrotation=45, # Adjust if names are long
+                    margin=10Plots.mm, # Add margin for labels
+                    c=:viridis, aspect_ratio=:auto) # Use heatmap for clarity
+        
+        display(p)
+        println("Performance metric plot for $(metric_labels[idx]) generated.")
     end
-    
-    # Sort by performance
-    sorted_idx = sortperm(avg_metric)
-    sorted_names = names[sorted_idx]
-    sorted_metrics = avg_metric[sorted_idx]
-    
-    # Create metrics names
-    metric_name = String(metric)
-    title_name = join(split(metric_name, "_"), " ")
-    
-    # Create bar plot
-    p = bar(
-        sorted_names,
-        sorted_metrics,
-        xlabel="Optimizer",
-        ylabel=title_name,
-        title="Average $title_name Across Functions",
-        xrotation=45,
-        size=(900, 500),
-        legend=false
-    )
-    
-    return p
 end
 
-# Create the visualizations
-success_plot = plot_success_heatmap(benchmark_results, test_functions, all_names)
-distance_plot = plot_performance_metrics(benchmark_results, test_functions, all_names, :mean_distance)
-runtime_plot = plot_performance_metrics(benchmark_results, test_functions, all_names, :mean_runtime)
-
-# Display the plots
-success_plot
-```
-
-```julia
-distance_plot
-```
-
-```julia
-runtime_plot
+# Call the functions to create plots
+# plot_success_heatmap(benchmark_results, test_functions, all_names)
+display(plot_success_heatmap(benchmark_results, test_functions, all_names))
+println("Success heatmap generated.")
+plot_performance_metrics(benchmark_results, test_functions, all_names)
 ```
 
 ## Detailed Analysis
@@ -376,60 +388,118 @@ print_summary_table(benchmark_results, test_functions, all_names)
 Let's take a closer look at the Rastrigin function, which is known for its many local minima:
 
 ```julia
-# Get the Rastrigin function
-rastrigin = test_functions[3]  # Index may vary, check the list
+# Find the Rastrigin function correctly by name
+rastrigin_idx = findfirst(f -> occursin("Rastrigin", f.name), test_functions)
+if isnothing(rastrigin_idx)
+    # Fallback if not found by name - use a reasonable default
+    println("Warning: Rastrigin function not found by name, using test_functions[3] as fallback")
+    rastrigin = test_functions[3]
+else
+    rastrigin = test_functions[rastrigin_idx]
+    println("Found Rastrigin function: $(rastrigin.name)")
+end
 
 # Run a more detailed benchmark on Rastrigin
 rastrigin_results = Dict{String, Any}()
+optimizers_requiring_ad = [NelderMead] # Redefine or pass from outside
 
 for (i, optimizer) in enumerate(all_optimizers)
     name = all_names[i]
-    println("Testing $name on Rastrigin...")
     
+    current_autodiff = :none
+    if any(T -> typeof(optimizer) <: T, optimizers_requiring_ad)
+         println("Testing $name on Rastrigin (using autodiff=AutoForwardDiff)...")
+         current_autodiff = Optimization.AutoForwardDiff()
+    else
+         println("Testing $name on Rastrigin (using autodiff=:none)...")
+         current_autodiff = :none
+    end
+
     try
-        rastrigin_results[name] = run_benchmark(rastrigin, optimizer, 2, 5000, 20)
+        # Use dimension=2 for Rastrigin case study and pass autodiff
+        rastrigin_results[name] = run_benchmark(rastrigin, optimizer, 2, 20000, 20; autodiff=current_autodiff, maxtime=45.0)
         
-        # Print detailed results
-        println("  Success Rate: $(rastrigin_results[name].success_rate)")
-        println("  Mean Distance: $(rastrigin_results[name].mean_distance)")
-        println("  Best Objective: $(rastrigin_results[name].best_objective)")
+        # Print detailed results only if successful
+        if rastrigin_results[name].mean_objective != Inf
+            println("  Success Rate: $(rastrigin_results[name].success_rate)")
+            println("  Mean Distance: $(rastrigin_results[name].mean_distance)")
+            println("  Best Objective: $(rastrigin_results[name].best_objective)")
+        else
+             println("  Failed or yielded no valid results.")
+        end
     catch e
-        println("  Failed: $e")
+        println("  Failed catastrophically: $e")
     end
 end
 
-# Visualize Rastrigin and solutions
-function visualize_rastrigin_solutions()
+# Visualize Rastrigin solutions 
+function visualize_rastrigin_solutions(rastrigin, rastrigin_results, all_names)
     # Create the function plot using recipe defined in BlackBoxOptimizationBenchmarking
-    p = plot(rastrigin, size=(800, 600), zoom=1.5)
+    p = plot(rastrigin, size=(800, 600), zoom=1.5,
+             title="Rastrigin Function with Optimizer Solutions",
+             xlabel="x₁", ylabel="x₂")
     
     # Plot some solution points from different optimizers
     optimizer_colors = Dict(zip(all_names, 1:length(all_names)))
     
+    # Keep track of successful optimizers for the legend
+    successful_optimizers = String[]
+    
     for (name, results) in rastrigin_results
         if haskey(results, :raw_results) && !isempty(results.raw_results)
             # Get the best result
-            best_idx = argmin([r.objective for r in results.raw_results])
-            best_result = results.raw_results[best_idx]
-            
-            # Add the solution point to the plot
-            scatter!(
-                p,
-                [best_result.solution[1]],
-                [best_result.solution[2]],
-                label=name,
-                markersize=6,
-                markershape=:circle,
-                color=get(optimizer_colors, name, 1)
-            )
+            objectives = [r.objective for r in results.raw_results]
+            if !isempty(objectives)
+                best_idx = argmin(objectives)
+                best_result = results.raw_results[best_idx]
+                
+                if length(best_result.solution) >= 2
+                    # Add the solution point to the plot
+                    scatter!(
+                        p,
+                        [best_result.solution[1]],
+                        [best_result.solution[2]],
+                        label=name,
+                        markersize=8,
+                        markershape=:circle,
+                        color=get(optimizer_colors, name, 1),
+                        markerstrokewidth=2
+                    )
+                    push!(successful_optimizers, name)
+                    
+                    # Print some debugging info
+                    println("Added solution for $name at coordinates ($(best_result.solution[1]), $(best_result.solution[2]))")
+                else
+                    println("Solution for $name doesn't have enough dimensions: $(best_result.solution)")
+                end
+            end
         end
+    end
+    
+    # Add legend if we have any successful optimizers
+    if !isempty(successful_optimizers)
+        p = plot!(p, legend=:topleft)
     end
     
     return p
 end
 
-rastrigin_plot = visualize_rastrigin_solutions()
-rastrigin_plot
+# Check if we have enough valid results before visualizing
+println("Checking Rastrigin results availability...")
+if !isempty(rastrigin_results) && any(haskey.(values(rastrigin_results), :raw_results))
+    println("Found valid results. Attempting to create visualization...")
+    try
+        rastrigin_plot = visualize_rastrigin_solutions(rastrigin, rastrigin_results, all_names)
+        println("Visualization created successfully.")
+        display(rastrigin_plot)
+        println("Rastrigin solution visualization generated and displayed.")
+    catch e
+        println("Error creating Rastrigin visualization: $e")
+        println("This is likely due to the plotting backend issue and doesn't affect benchmark results.")
+    end
+else
+    println("Not enough valid results to create Rastrigin visualization")
+end
 ```
 
 ## Conclusion
@@ -443,3 +513,10 @@ Based on our results, we can make the following observations:
 3. Runtime can vary significantly between optimizers, with simpler methods often being faster but less reliable.
 
 This benchmark provides a foundation for selecting appropriate black-box optimization algorithms for specific problem types and constraints.
+
+## Appendix
+
+```julia, echo = false
+using SciMLBenchmarks
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder],WEAVE_ARGS[:file])
+```
